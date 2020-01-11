@@ -5,7 +5,10 @@ import websockets
 import asyncio
 import pathlib
 import uri as urilib
-from typing import Any, Callable, Tuple, Type, Union, Optional, AsyncIterator
+import datetime
+import functools
+from typing import Any, Callable, Tuple, Type, Union, Optional, AsyncIterator, cast, IO
+from datetime import date
 wscp = websockets.WebSocketClientProtocol
 
 from utils import cast_and_check, IPAddress, IPInterface, register_ws_urls
@@ -21,6 +24,8 @@ def main() -> None:
                              help="IP address of the reciever", dest="send_ip")
     send_parser.add_argument("--port", type=port_parser, required=True,
                              help="Port open on the reciever", dest="send_port")
+    send_parser.add_argument("--file", type=argparse.FileType(mode="rb"), default=None,
+                             help="File to send to reciever", dest="file")
     send_parser.set_defaults(func=sender_handler)
     recieve_parser = subparsers.add_parser("recieve", help="Run program in listen mode")
     recieve_parser.add_argument("--net", type=str, required=False,
@@ -35,12 +40,23 @@ def main() -> None:
 def sender_handler(args: argparse.Namespace):
     ip = cast_and_check(args.send_ip, IPAddress)
     port = cast_and_check(args.send_port, int)
-    uri = urilib.URI(scheme="ws", host=str(ip), port=port, path="/clipboard")
-    async def send():
-        async with websockets.connect(str(uri)) as websocket:
+    file = cast_and_check(args.file, Optional[IO])
+    uri = urilib.URI(scheme="ws", host=str(ip), port=port)
+    async def send_clipboard():
+        async with websockets.connect(str(uri / "clipboard")) as websocket:
             await websocket.send(message=pyperclip.paste())
+
+    async def send_file():
+        async with websockets.connect(str(uri / "file")) as websocket:
+            await websocket.send(message=pathlib.Path(file.name).name)
+            file_iter = iter(functools.partial(file.read, 1024 * 1024 * 8), b'')
+            for chunk in file_iter:
+                #print("sending chunk...")
+                await websocket.send(chunk)
+            await websocket.send("end")
+
     
-    asyncio.run(send())
+    asyncio.run(send_clipboard() if file is None else send_file())
 
 def reciever_handler(args: argparse.Namespace):
     network = cast_and_check(args.network, str)
@@ -56,10 +72,29 @@ def reciever_handler(args: argparse.Namespace):
             pyperclip.copy(clipboard)
             # :TODO: I should definitely use a logger for this
             print(f"Clipboard set to {repr(clipboard)} from {websocket.remote_address}")
+        elif path == "/file":
+            prev = datetime.datetime.now()
+            filename: str = await websocket.recv()
+            if not isinstance(filename, str): return
+            filename = pathlib.Path(filename).name
+            written = 0
+            packets = 0
+            with open("./"+filename, mode="xb") as fileio:
+                while isinstance((payload := await websocket.recv()), bytes):
+                    written += len(payload)
+                    packets += 1
+                    #print(f"Writing payload {repr(payload)}")
+                    fileio.write(payload)
+                fileio.flush()
+            delta = datetime.datetime.now() - prev
+            print(f"Written {written} bytes to file {repr(filename)} from{websocket.remote_address}")
+            print(f"Transfer took {delta.seconds} seconds with an average packet size of {written // packets} bytes")
+            print(f"Average transfer speed was {(written / delta.seconds) / 1024**2} Mb/s")
     
     start_server = websockets.serve(root_handler,
                                     network, 
-                                    port)
+                                    port,
+                                    max_size=None)
     asyncio.get_event_loop().run_until_complete(start_server)
     asyncio.get_event_loop().run_forever()
 

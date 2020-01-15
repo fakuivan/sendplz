@@ -1,18 +1,18 @@
+from io import BytesIO
 import click
 import pyperclip
 import websockets
 import asyncio
 import pathlib
 import uri as urilib
-import datetime
 import functools
 import protocol
-from typing import Any, Optional, BinaryIO, Callable, ContextManager
+from typing import Awaitable, Optional, BinaryIO, Callable, AsyncContextManager
 import typeguard
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 wscp = websockets.WebSocketClientProtocol
 
-from utils import cast_and_check, IPAddress, IPInterface, register_ws_urls
+from utils import cast_and_check, register_ws_urls, wrap_aiter
 register_ws_urls(urilib)
 
 @click.group()
@@ -31,11 +31,15 @@ def send(ip: str, port: int, file: Optional[BinaryIO] = None):
     """Run program in send mode"""
 
     if file is not None:
-        reader = lambda: (pathlib.Path(file.name).name,
-                          iter(functools.partial(file.read, 1024 * 1024 * 8), b''))
-        protocol.send_file(ip, port, reader)
+        @asynccontextmanager
+        async def reader(file: BytesIO):
+            yield (pathlib.Path(file.name).name,
+                   wrap_aiter(iter(functools.partial(file.read, 1024 * 1024 * 8), b'')))
+        sender = protocol.send_file(ip, port, reader(file))
     else:
-        protocol.send_clipboard(ip, port, pyperclip.paste())
+        sender = protocol.send_clipboard(ip, port, pyperclip.paste())
+
+    asyncio.run(sender)
 
 
 class CLISessionHanlder(protocol.SessionHandler):
@@ -47,25 +51,25 @@ class CLISessionHanlder(protocol.SessionHandler):
     def initialized(self) -> bool:
         return self.address is not None
 
-    def ip_authenticate(self, address: str) -> bool:
+    async def ip_authenticate(self, address: str) -> bool:
         self.address = address
-        click.echo(f"Authenticated address {repr(address)}")
+        click.echo(f"Authenticated address {address!r}")
         return True
 
-    def set_clipboard(self, clipboard: str) -> None:
+    async def set_clipboard(self, clipboard: str) -> None:
         pyperclip.copy(clipboard)
-        click.echo(f"Clipboard set to {repr(clipboard)} by {repr(self.address)}")
+        click.echo(f"Clipboard set to {clipboard!r} by {self.address!r}")
 
     def open_file(self, filename: str, estimated_size: Optional[int]) -> \
-        ContextManager[Callable[[bytes], None]]:
-        click.echo(f"Remote {repr(self.address)} requested to write to file {repr(filename)}")
-        @contextmanager
-        def manager():
+        AsyncContextManager[Callable[[bytes], Awaitable[None]]]:
+        click.echo(f"Remote {self.address!r} requested to write to file {filename!r}")
+        @asynccontextmanager
+        async def manager():
+            file = cast_and_check(
+                open("./" + pathlib.Path(filename).name, mode="xb"), BinaryIO)
+            async def write(payload: bytes):
+                assert file.write(payload) == len(payload)
             try:
-                file = cast_and_check(
-                    open("./" + pathlib.Path(filename).name, mode="wb"), BinaryIO)
-                def write(payload: bytes):
-                    assert file.write(payload) == len(payload)
                 yield write
             finally:
                 file.close()
@@ -73,7 +77,7 @@ class CLISessionHanlder(protocol.SessionHandler):
 
     def fatal_error(self) -> None:
         pass
-    
+
     def __del__(self):
         if self.initialized:
             click.echo(f"Session closed for address {self.address}")
@@ -85,6 +89,9 @@ class CLISessionHanlder(protocol.SessionHandler):
 @typeguard.typechecked
 def recieve(network: str, port: int):
     """Run program in listen mode"""
-    protocol.listen(CLISessionHanlder, network, port)
+    click.echo(f"Running server in listen mode ({network!r}, {port})")
+    asyncio.get_event_loop().run_until_complete(
+        protocol.listen(CLISessionHanlder, network, port))
+    asyncio.get_event_loop().run_forever()
 
 if __name__ == "__main__": cli()

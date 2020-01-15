@@ -1,7 +1,5 @@
-from typing import TypeVar, Any, Type, Union, cast
-from types import ModuleType
+from typing import Generic, TypeVar, Any, Type, Union, cast, Iterator, AsyncIterator
 from typeguard import check_type
-import uri
 import ipaddress
 
 IPInterface = Union[ipaddress.IPv4Interface,
@@ -21,3 +19,17 @@ T = TypeVar("T")
 def cast_and_check(obj: Any, type_: Type[T], var_name: str="passed") -> T:
     check_type(var_name, obj, type_)
     return cast(type_, obj)
+
+
+def wrap_aiter(iterator: Iterator[T]) -> AsyncIterator[T]:
+    class AIter(AsyncIterator[T], Generic[T]):
+        def __init__(self, iter_: Iterator[T]):
+            self.parent = iter_
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            try:
+                return next(self.parent)
+            except StopIteration:
+                raise StopAsyncIteration
+    return AIter(iterator)
